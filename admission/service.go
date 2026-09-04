@@ -148,6 +148,9 @@ func (s *Service) ApplyOwnerBlocker(ctx context.Context, op OwnerBlockerOp) (Can
 	if op.Owner == OwnerAuthorization {
 		return Candidate{}, fmt.Errorf("%w: the authorization blocker is driven only by ApplyAuthorizationDecision", ErrInvalidBlockerOp)
 	}
+	if op.State != BlockerActive && op.State != BlockerCleared {
+		return Candidate{}, fmt.Errorf("%w: undefined blocker state %d", ErrInvalidBlockerOp, int(op.State))
+	}
 	rec := OperationRecord{
 		OperationID: op.OperationID,
 		CandidateID: op.CandidateID,

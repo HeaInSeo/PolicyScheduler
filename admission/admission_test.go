@@ -518,6 +518,26 @@ func TestInvalidRequestsRejected(t *testing.T) {
 	}
 }
 
+// TestUndefinedBlockerStateRejected proves an out-of-range BlockerState supplied by an
+// embedding caller (e.g. from decoded input) is rejected fail-closed and never
+// persisted outside the declared ACTIVE/CLEARED domain.
+func TestUndefinedBlockerStateRejected(t *testing.T) {
+	ctx := context.Background()
+	s := newService()
+	mustRegister(t, s, RegisterRequest{CandidateID: "c1", Owners: []BlockerOwner{OwnerAuthorization, ownerReadiness}})
+	_, err := s.ApplyOwnerBlocker(ctx, OwnerBlockerOp{
+		OperationID: "op-bad", CandidateID: "c1", Owner: ownerReadiness, State: BlockerState(99),
+	})
+	if !errors.Is(err, ErrInvalidBlockerOp) {
+		t.Fatalf("undefined blocker state: expected ErrInvalidBlockerOp, got %v", err)
+	}
+	// The bad operation must not have been recorded, and the blocker is unchanged.
+	cand, _, _ := s.GetCandidate(ctx, "c1")
+	if got := cand.Blockers[ownerReadiness].State; got != BlockerActive {
+		t.Fatalf("undefined state leaked into durable blocker: %v", got)
+	}
+}
+
 // TestWhitespaceCandidateIDRejected proves the candidate identity (which IS the pre-Run
 // intent reference, RA-I0 §1) is trim-validated, not just checked for emptiness — a
 // whitespace-only id must fail closed rather than durably create a blank-identity
