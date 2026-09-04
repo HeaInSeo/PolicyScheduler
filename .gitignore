@@ -1,0 +1,9 @@
+# Go build/test artifacts
+*.exe
+*.test
+*.out
+/vendor/
+
+# Local agent/tooling scaffolding — not part of the repository
+/.claude/
+/.specify/
