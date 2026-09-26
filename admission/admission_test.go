@@ -3,6 +3,7 @@ package admission
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -488,6 +489,123 @@ func TestRegistrationIdempotencyAndConflict(t *testing.T) {
 	_, err := s.RegisterCandidate(ctx, RegisterRequest{CandidateID: "c1", Owners: []BlockerOwner{OwnerAuthorization}})
 	if !errors.Is(err, ErrCandidateConflict) {
 		t.Fatalf("expected ErrCandidateConflict, got %v", err)
+	}
+}
+
+// TestRegistrationUrgencyPriorityImmutable proves clinical urgency and requested
+// priority are immutable registration semantics (RA-C3/C7): a re-registration under the
+// same id with the same values reconciles, while a differing urgency or priority fails
+// closed with ErrCandidateConflict instead of silently returning success and dropping
+// the new value. The stored candidate (including blocker progress) is left unchanged,
+// and the same verdict holds for a fresh Service over the same Store.
+func TestRegistrationUrgencyPriorityImmutable(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	s := New(store)
+	base := RegisterRequest{
+		CandidateID: "c1", Owners: []BlockerOwner{OwnerAuthorization, ownerReadiness},
+		ClinicalUrgency: "routine", RequestedPriority: "normal",
+	}
+	mustRegister(t, s, base)
+	if _, err := s.ApplyOwnerBlocker(ctx, OwnerBlockerOp{
+		OperationID: "op-ready", CandidateID: "c1", Owner: ownerReadiness, State: BlockerCleared,
+	}); err != nil {
+		t.Fatalf("clear readiness: %v", err)
+	}
+
+	// Same values (owner order permuted) → idempotent, returns the stored candidate.
+	same := base
+	same.Owners = []BlockerOwner{ownerReadiness, OwnerAuthorization}
+	got, err := s.RegisterCandidate(ctx, same)
+	if err != nil {
+		t.Fatalf("idempotent re-register: %v", err)
+	}
+	if got.Blockers[ownerReadiness].State != BlockerCleared {
+		t.Fatal("idempotent re-register reset blocker progress")
+	}
+
+	drifts := map[string]RegisterRequest{}
+	urgency := base
+	urgency.ClinicalUrgency = "critical"
+	drifts["urgency"] = urgency
+	priority := base
+	priority.RequestedPriority = "high"
+	drifts["priority"] = priority
+	emptied := base
+	emptied.ClinicalUrgency, emptied.RequestedPriority = "", ""
+	drifts["cleared-both"] = emptied
+
+	check := func(svc *Service) {
+		t.Helper()
+		for name, req := range drifts {
+			if _, err := svc.RegisterCandidate(ctx, req); !errors.Is(err, ErrCandidateConflict) {
+				t.Fatalf("%s drift: expected ErrCandidateConflict, got %v", name, err)
+			}
+		}
+		stored, ok, err := svc.GetCandidate(ctx, "c1")
+		if err != nil || !ok {
+			t.Fatalf("GetCandidate: ok=%v err=%v", ok, err)
+		}
+		if stored.ClinicalUrgency != "routine" || stored.RequestedPriority != "normal" {
+			t.Fatalf("conflicting re-register rewrote semantics: urgency=%q priority=%q", stored.ClinicalUrgency, stored.RequestedPriority)
+		}
+		if stored.Blockers[ownerReadiness].State != BlockerCleared || stored.Blockers[OwnerAuthorization].State != BlockerActive {
+			t.Fatalf("conflicting re-register changed blockers: %+v", stored.Blockers)
+		}
+	}
+	check(s)
+	// Service restart over the same Store: the verdict is a Store property, not
+	// per-Service memory. (Durable-backend reopen is RA-I1 D4 and needs a real Store.)
+	check(New(store))
+}
+
+// TestConcurrentRegistrationUrgencyConflict proves concurrent registrations of the same
+// id with differing urgency converge to exactly one stored registration: callers whose
+// semantics match the winner succeed, every other caller gets ErrCandidateConflict, and
+// no caller is told a value was accepted that the Store did not keep.
+func TestConcurrentRegistrationUrgencyConflict(t *testing.T) {
+	ctx := context.Background()
+	s := newService()
+	urgencies := []string{"routine", "urgent", "critical", "routine", "urgent", "critical", "routine", "urgent"}
+
+	type result struct {
+		urgency string
+		cand    Candidate
+		err     error
+	}
+	results := make([]result, len(urgencies))
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i, u := range urgencies {
+		wg.Add(1)
+		go func(i int, u string) {
+			defer wg.Done()
+			<-start
+			cand, err := s.RegisterCandidate(ctx, RegisterRequest{
+				CandidateID: "c1", Owners: []BlockerOwner{OwnerAuthorization}, ClinicalUrgency: u,
+			})
+			results[i] = result{urgency: u, cand: cand, err: err}
+		}(i, u)
+	}
+	close(start)
+	wg.Wait()
+
+	stored, ok, err := s.GetCandidate(ctx, "c1")
+	if err != nil || !ok {
+		t.Fatalf("GetCandidate: ok=%v err=%v", ok, err)
+	}
+	for _, r := range results {
+		switch {
+		case r.urgency == stored.ClinicalUrgency:
+			if r.err != nil {
+				t.Fatalf("caller matching stored urgency %q failed: %v", r.urgency, r.err)
+			}
+			if r.cand.ClinicalUrgency != stored.ClinicalUrgency {
+				t.Fatalf("caller got urgency %q, stored %q", r.cand.ClinicalUrgency, stored.ClinicalUrgency)
+			}
+		case !errors.Is(r.err, ErrCandidateConflict):
+			t.Fatalf("caller with urgency %q (stored %q): expected ErrCandidateConflict, got %v", r.urgency, stored.ClinicalUrgency, r.err)
+		}
 	}
 }
 

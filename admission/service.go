@@ -50,8 +50,9 @@ type RegisterRequest struct {
 }
 
 // RegisterCandidate validates and durably records a candidate. It is idempotent by
-// CandidateID (same id + same owner set reconciles to the existing candidate); a
-// re-registration under the same id with a different owner set fails closed.
+// CandidateID (same id + same owner set, urgency and priority reconciles to the
+// existing candidate); a re-registration under the same id that differs in any of them
+// fails closed with ErrCandidateConflict.
 func (s *Service) RegisterCandidate(ctx context.Context, req RegisterRequest) (Candidate, error) {
 	if strings.TrimSpace(string(req.CandidateID)) == "" {
 		return Candidate{}, fmt.Errorf("%w: empty candidate id", ErrInvalidRequest)

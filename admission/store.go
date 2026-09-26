@@ -22,8 +22,9 @@ import (
 //     disagreeing.
 type Store interface {
 	// CreateCandidate durably records a new candidate. Idempotent by CandidateID with
-	// the same applicable owner set (returns the existing candidate); a re-registration
-	// under the same id with a different owner set fails closed with ErrCandidateConflict.
+	// the same applicable owner set, clinical urgency and requested priority (returns the
+	// existing candidate); a re-registration under the same id that differs in any of
+	// them fails closed with ErrCandidateConflict and stores nothing.
 	CreateCandidate(ctx context.Context, cand Candidate) (Candidate, error)
 
 	// GetCandidate returns a deep copy of a durable candidate, or ok=false if absent.
@@ -52,8 +53,9 @@ type OperationRecord struct {
 var (
 	// ErrCandidateNotFound reports an unknown CandidateID.
 	ErrCandidateNotFound = errors.New("admission: candidate not found")
-	// ErrCandidateConflict reports re-registration of a candidate id with a different
-	// immutable identity (applicable owner set).
+	// ErrCandidateConflict reports re-registration of a candidate id with different
+	// immutable registration semantics (applicable owner set, clinical urgency or
+	// requested priority).
 	ErrCandidateConflict = errors.New("admission: candidate id conflicts with a prior registration")
 	// ErrOperationConflict reports the same operation id re-used with different immutable
 	// semantics — rejected fail-closed, never silently rewritten (RA-I0 §6).
@@ -87,7 +89,7 @@ func (s *MemoryStore) CreateCandidate(_ context.Context, cand Candidate) (Candid
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, ok := s.candidates[cand.CandidateID]; ok {
-		if !sameOwnerSet(existing.Blockers, cand.Blockers) {
+		if !sameRegistration(existing, cand) {
 			return Candidate{}, fmt.Errorf("%w: %q", ErrCandidateConflict, cand.CandidateID)
 		}
 		return cloneCandidate(existing), nil
@@ -140,6 +142,17 @@ func (s *MemoryStore) ApplyOperation(_ context.Context, op OperationRecord, muta
 	s.candidates[op.CandidateID] = cloneCandidate(next)
 	s.ops[op.OperationID] = op
 	return cloneCandidate(next), nil
+}
+
+// sameRegistration reports whether a re-registration carries the same immutable
+// registration semantics as the stored candidate: applicable owner set, declared
+// clinical urgency and requested priority (RA-C3: same identity + different semantics
+// conflicts). Urgency/priority are never silently dropped or rewritten here; changing
+// them is a separate append-only decision operation, not a re-registration (RA-C7).
+func sameRegistration(existing, cand Candidate) bool {
+	return existing.ClinicalUrgency == cand.ClinicalUrgency &&
+		existing.RequestedPriority == cand.RequestedPriority &&
+		sameOwnerSet(existing.Blockers, cand.Blockers)
 }
 
 // sameOwnerSet reports whether two blocker maps cover the same owner set (identity of a
