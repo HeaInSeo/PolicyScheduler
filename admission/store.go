@@ -11,7 +11,8 @@ import (
 // service/DB/topology commitment (the packet forbids it): durability is expressed only
 // through this abstraction, and MemoryStore is the reference implementation used by
 // tests. A real deployment can back it with any durable store without changing the
-// domain logic.
+// domain logic. Every backend must pass the storetest.Run contract suite; MemoryStore
+// passes it without the durable-reopen axis, which it cannot provide.
 //
 // The Store owns two atomicity guarantees the domain relies on:
 //   - CreateCandidate is idempotent by candidate identity (the originating pre-Run
