@@ -149,6 +149,9 @@ func (s *MemoryStore) ApplyOperation(_ context.Context, op OperationRecord, muta
 // clinical urgency and requested priority (RA-C3: same identity + different semantics
 // conflicts). Urgency/priority are never silently dropped or rewritten here; changing
 // them is a separate append-only decision operation, not a re-registration (RA-C7).
+// Comparison is exact byte equality: no case folding, trimming, enum mapping or other
+// normalization. The empty string means "unset" and is itself a registered value, so
+// empty vs non-empty conflicts like any other difference.
 func sameRegistration(existing, cand Candidate) bool {
 	return existing.ClinicalUrgency == cand.ClinicalUrgency &&
 		existing.RequestedPriority == cand.RequestedPriority &&

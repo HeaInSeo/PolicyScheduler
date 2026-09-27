@@ -534,6 +534,14 @@ func TestRegistrationUrgencyPriorityImmutable(t *testing.T) {
 	emptied := base
 	emptied.ClinicalUrgency, emptied.RequestedPriority = "", ""
 	drifts["cleared-both"] = emptied
+	// Exact byte equality: values that would be equal under case folding or trimming
+	// still conflict, because no normalization is applied (Q72 decision 7).
+	upperUrgency := base
+	upperUrgency.ClinicalUrgency = "Routine"
+	drifts["urgency-case"] = upperUrgency
+	paddedPriority := base
+	paddedPriority.RequestedPriority = " normal"
+	drifts["priority-whitespace"] = paddedPriority
 
 	check := func(svc *Service) {
 		t.Helper()
@@ -557,6 +565,38 @@ func TestRegistrationUrgencyPriorityImmutable(t *testing.T) {
 	// Service restart over the same Store: the verdict is a Store property, not
 	// per-Service memory. (Durable-backend reopen is RA-I1 D4 and needs a real Store.)
 	check(New(store))
+}
+
+// TestRegistrationEmptyUrgencyPriorityIsUnset proves empty urgency/priority means
+// "unset" and is itself an immutable registered value (Q72 decision 7): re-registering
+// with both still empty reconciles, while later supplying either value conflicts instead
+// of filling in the unset field.
+func TestRegistrationEmptyUrgencyPriorityIsUnset(t *testing.T) {
+	ctx := context.Background()
+	s := New(NewMemoryStore())
+	base := RegisterRequest{CandidateID: "c-unset", Owners: []BlockerOwner{OwnerAuthorization}}
+	mustRegister(t, s, base)
+
+	if _, err := s.RegisterCandidate(ctx, base); err != nil {
+		t.Fatalf("idempotent re-register with unset urgency/priority: %v", err)
+	}
+	withUrgency := base
+	withUrgency.ClinicalUrgency = "routine"
+	if _, err := s.RegisterCandidate(ctx, withUrgency); !errors.Is(err, ErrCandidateConflict) {
+		t.Fatalf("setting urgency on unset registration: expected ErrCandidateConflict, got %v", err)
+	}
+	withPriority := base
+	withPriority.RequestedPriority = "normal"
+	if _, err := s.RegisterCandidate(ctx, withPriority); !errors.Is(err, ErrCandidateConflict) {
+		t.Fatalf("setting priority on unset registration: expected ErrCandidateConflict, got %v", err)
+	}
+	stored, ok, err := s.GetCandidate(ctx, "c-unset")
+	if err != nil || !ok {
+		t.Fatalf("GetCandidate: ok=%v err=%v", ok, err)
+	}
+	if stored.ClinicalUrgency != "" || stored.RequestedPriority != "" {
+		t.Fatalf("unset registration was filled in: urgency=%q priority=%q", stored.ClinicalUrgency, stored.RequestedPriority)
+	}
 }
 
 // TestConcurrentRegistrationUrgencyConflict proves concurrent registrations of the same
