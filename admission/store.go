@@ -90,7 +90,7 @@ func (s *MemoryStore) CreateCandidate(_ context.Context, cand Candidate) (Candid
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, ok := s.candidates[cand.CandidateID]; ok {
-		if !sameRegistration(existing, cand) {
+		if !SameRegistration(existing, cand) {
 			return Candidate{}, fmt.Errorf("%w: %q", ErrCandidateConflict, cand.CandidateID)
 		}
 		return cloneCandidate(existing), nil
@@ -145,15 +145,16 @@ func (s *MemoryStore) ApplyOperation(_ context.Context, op OperationRecord, muta
 	return cloneCandidate(next), nil
 }
 
-// sameRegistration reports whether a re-registration carries the same immutable
+// SameRegistration reports whether a re-registration carries the same immutable
 // registration semantics as the stored candidate: applicable owner set, declared
 // clinical urgency and requested priority (RA-C3: same identity + different semantics
-// conflicts). Urgency/priority are never silently dropped or rewritten here; changing
+// conflicts). Every Store backend uses this one definition for its CreateCandidate
+// reconcile. Urgency/priority are never silently dropped or rewritten here; changing
 // them is a separate append-only decision operation, not a re-registration (RA-C7).
 // Comparison is exact byte equality: no case folding, trimming, enum mapping or other
 // normalization. The empty string means "unset" and is itself a registered value, so
 // empty vs non-empty conflicts like any other difference.
-func sameRegistration(existing, cand Candidate) bool {
+func SameRegistration(existing, cand Candidate) bool {
 	return existing.ClinicalUrgency == cand.ClinicalUrgency &&
 		existing.RequestedPriority == cand.RequestedPriority &&
 		sameOwnerSet(existing.Blockers, cand.Blockers)
