@@ -259,6 +259,125 @@ func assertOpenLeavesFileUntouched(t *testing.T, path string, want error) {
 	}
 }
 
+// A foreign database left after a crash with committed frames still in its -wal is
+// refused without checkpointing: the main file and the -wal stay byte-identical and
+// no -shm or -journal appears. The foreign table exists only in the WAL, so the
+// refusal also proves ownership is judged with the WAL applied.
+func TestOpenRefusesForeignCrashStateWAL(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "crashed.db")
+	raw, err := sql.Open("sqlite", src)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	raw.SetMaxOpenConns(1)
+	for _, stmt := range []string{
+		"PRAGMA journal_mode = WAL",
+		"PRAGMA wal_autocheckpoint = 0",
+		"CREATE TABLE other (x TEXT)",
+		"INSERT INTO other VALUES ('foreign')",
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	// Copy the files while the writer is still open: that is the on-disk state a crash
+	// leaves behind (the normal close below would checkpoint the WAL away).
+	path := filepath.Join(dir, "admission.db")
+	for _, suffix := range []string{"", "-wal"} {
+		b, err := os.ReadFile(src + suffix)
+		if err != nil {
+			t.Fatalf("read %s: %v", src+suffix, err)
+		}
+		if suffix == "-wal" && len(b) == 0 {
+			t.Fatal("precondition: the crash-state WAL holds no frames")
+		}
+		if err := os.WriteFile(path+suffix, b, 0o600); err != nil {
+			t.Fatalf("write %s: %v", path+suffix, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+	before := map[string][]byte{}
+	for _, suffix := range []string{"", "-wal"} {
+		if before[suffix], err = os.ReadFile(path + suffix); err != nil {
+			t.Fatalf("read before: %v", err)
+		}
+	}
+	if s, err := sqlitestore.Open(context.Background(), path); !errors.Is(err, sqlitestore.ErrForeignDatabase) {
+		if s != nil {
+			_ = s.Close()
+		}
+		t.Fatalf("Open crash-state foreign file: err=%v, want ErrForeignDatabase", err)
+	}
+	for _, suffix := range []string{"", "-wal"} {
+		after, err := os.ReadFile(path + suffix)
+		if err != nil {
+			t.Fatalf("refused Open removed %s: %v", path+suffix, err)
+		}
+		if !bytes.Equal(before[suffix], after) {
+			t.Fatalf("refused Open modified %q (%d → %d bytes)", "admission.db"+suffix, len(before[suffix]), len(after))
+		}
+	}
+	for _, suffix := range []string{"-shm", "-journal"} {
+		if _, err := os.Stat(path + suffix); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("refused Open left %s behind: %v", suffix, err)
+		}
+	}
+}
+
+// Blocker owners are stored as JSON, which cannot carry invalid UTF-8 byte for byte.
+// Such an owner is refused before anything is written, on create and through an
+// operation; valid owners, including case- and accent-distinct ones, keep their exact
+// bytes across a reopen.
+func TestBlockerOwnerByteIdentity(t *testing.T) {
+	ctx := context.Background()
+	path := dbPath(t)
+	s := mustOpen(t, path)
+	for name, owner := range map[string]admission.BlockerOwner{"invalid-byte": "\xff", "truncated-rune": "readi\xc3", "invalid-in-valid": "Read\xfeiness"} {
+		cand := admission.Candidate{CandidateID: admission.CandidateID("c-" + name), Blockers: map[admission.BlockerOwner]admission.Blocker{
+			owner: {Owner: owner, State: admission.BlockerActive},
+		}}
+		if _, err := s.CreateCandidate(ctx, cand); !errors.Is(err, sqlitestore.ErrInvalidOwner) {
+			t.Fatalf("%s: CreateCandidate err=%v, want ErrInvalidOwner", name, err)
+		}
+		if _, ok, err := s.GetCandidate(ctx, cand.CandidateID); ok || err != nil {
+			t.Fatalf("%s: refused candidate stored: ok=%v err=%v", name, ok, err)
+		}
+	}
+
+	valid := admission.Candidate{CandidateID: "c-valid", Blockers: map[admission.BlockerOwner]admission.Blocker{
+		"Prüfung": {Owner: "Prüfung", State: admission.BlockerActive},
+		"prüfung": {Owner: "prüfung", State: admission.BlockerActive},
+		"PRÜFUNG": {Owner: "PRÜFUNG", State: admission.BlockerActive},
+	}}
+	if _, err := s.CreateCandidate(ctx, valid); err != nil {
+		t.Fatalf("CreateCandidate(valid): %v", err)
+	}
+	op := admission.OperationRecord{OperationID: "op-invalid", CandidateID: "c-valid", Fingerprint: "f"}
+	if _, err := s.ApplyOperation(ctx, op, func(c *admission.Candidate) error {
+		c.Blockers["\xff"] = admission.Blocker{Owner: "\xff", State: admission.BlockerActive}
+		return nil
+	}); !errors.Is(err, sqlitestore.ErrInvalidOwner) {
+		t.Fatalf("ApplyOperation adding invalid owner: err=%v, want ErrInvalidOwner", err)
+	}
+	// The refused operation was not recorded: the same ID now applies as a fresh operation.
+	applied := false
+	if _, err := s.ApplyOperation(ctx, op, func(*admission.Candidate) error { applied = true; return nil }); err != nil || !applied {
+		t.Fatalf("operation after refusal: applied=%v err=%v, want a fresh apply", applied, err)
+	}
+
+	r := reopen(t, s, path)
+	got, ok, err := r.GetCandidate(ctx, "c-valid")
+	if err != nil || !ok {
+		t.Fatalf("GetCandidate after reopen: ok=%v err=%v", ok, err)
+	}
+	if !reflect.DeepEqual(got, valid) {
+		t.Fatalf("owner bytes changed across reopen\nwant=%#v\ngot=%#v", valid.Blockers, got.Blockers)
+	}
+}
+
 func TestOpenRejectsInvalidPath(t *testing.T) {
 	for _, p := range []string{"", "a.db?mode=ro"} {
 		if s, err := sqlitestore.Open(context.Background(), p); err == nil {

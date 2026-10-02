@@ -17,7 +17,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -61,6 +64,11 @@ var ErrUnsupportedSchema = errors.New("sqlitestore: unsupported schema version")
 // package. It is never stamped, migrated or adopted.
 var ErrForeignDatabase = errors.New("sqlitestore: database file is not a PolicyScheduler admission store")
 
+// ErrInvalidOwner reports a blocker owner that is not valid UTF-8. Owners are stored
+// as JSON, which would replace invalid bytes and so lose the owner's exact-byte
+// identity; such a candidate is refused before anything is written.
+var ErrInvalidOwner = errors.New("sqlitestore: blocker owner is not valid UTF-8")
+
 // Store is a J1 SQLite admission.Store. It is safe for concurrent use within the
 // owning process: every operation runs in its own transaction on the single
 // connection, so operations are serialized.
@@ -75,6 +83,9 @@ var _ admission.Store = (*Store)(nil)
 func Open(ctx context.Context, path string) (*Store, error) {
 	if path == "" || strings.ContainsRune(path, '?') {
 		return nil, fmt.Errorf("sqlitestore: invalid database path %q", path)
+	}
+	if err := preflight(ctx, path); err != nil {
+		return nil, err
 	}
 	// EXCLUSIVE locking must be set before WAL is first used so no shared-memory
 	// index is created; busy_timeout(0) makes a fenced second writer fail fast. WAL is
@@ -105,17 +116,58 @@ func Open(ctx context.Context, path string) (*Store, error) {
 // Close releases the database and its single-writer lock.
 func (s *Store) Close() error { return s.db.Close() }
 
-func migrate(ctx context.Context, db *sql.DB) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return classify("begin migration", err)
+// preflight protects a file left with a non-empty -wal (a crash, or a live writer).
+// Closing the writable handle after migrate refuses such a file would checkpoint the
+// WAL into it, and SQLite cannot read a WAL database through a read-only handle here
+// without creating a -shm. So ownership is judged, with the WAL applied, on a private
+// copy of the main file and its -wal; the original is opened writable only if the copy
+// is ours or brand-new empty. Ownership refusals are returned; any other probe failure
+// (for example a torn copy of a live writer's WAL) falls through to the writer open,
+// which fences or reports it. A file without a -wal is verified by migrate as before.
+func preflight(ctx context.Context, path string) error {
+	info, err := os.Stat(path + "-wal")
+	if err != nil || info.Size() == 0 {
+		return nil
 	}
-	defer func() { _ = tx.Rollback() }()
+	dir, err := os.MkdirTemp("", "sqlitestore-preflight-")
+	if err != nil {
+		return fmt.Errorf("sqlitestore: preflight: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	probe := filepath.Join(dir, "probe.db")
+	for _, suffix := range []string{"", "-wal"} {
+		if err := copyFile(path+suffix, probe+suffix); err != nil {
+			return fmt.Errorf("sqlitestore: preflight copy: %w", err)
+		}
+	}
+	db, err := sql.Open("sqlite", probe)
+	if err != nil {
+		return fmt.Errorf("sqlitestore: preflight open: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+	if err := verifyOwnership(ctx, db); errors.Is(err, ErrForeignDatabase) || errors.Is(err, ErrUnsupportedSchema) {
+		return err
+	}
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	b, err := os.ReadFile(src) // #nosec G304 -- the caller's own database path
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, b, 0o600)
+}
+
+// verifyOwnership adopts only a file marked with applicationID (at a schema version
+// this build understands) or an unmarked, brand-new empty database.
+func verifyOwnership(ctx context.Context, q rowQuerier) error {
 	var appID, version int
-	if err := tx.QueryRowContext(ctx, "PRAGMA application_id").Scan(&appID); err != nil {
+	if err := q.QueryRowContext(ctx, "PRAGMA application_id").Scan(&appID); err != nil {
 		return classify("read application id", err)
 	}
-	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+	if err := q.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return classify("read schema version", err)
 	}
 	switch {
@@ -126,7 +178,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	case appID == 0 && version == 0:
 		// Unmarked: adopt it only if it is a brand-new empty database.
 		var objects int
-		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master").Scan(&objects); err != nil {
+		if err := q.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master").Scan(&objects); err != nil {
 			return classify("inspect unmarked database", err)
 		}
 		if objects != 0 {
@@ -134,6 +186,19 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		}
 	default:
 		return fmt.Errorf("%w: application_id=%#x user_version=%d", ErrForeignDatabase, appID, version)
+	}
+	return nil
+}
+
+func migrate(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return classify("begin migration", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Re-checked under the writer lock: the file may have changed since preflight.
+	if err := verifyOwnership(ctx, tx); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, schema); err != nil {
 		return classify("init schema", err)
@@ -174,6 +239,9 @@ func classify(step string, err error) error {
 
 // CreateCandidate implements admission.Store.
 func (s *Store) CreateCandidate(ctx context.Context, cand admission.Candidate) (admission.Candidate, error) {
+	if err := checkOwners(cand); err != nil {
+		return admission.Candidate{}, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return admission.Candidate{}, classify("begin create", err)
@@ -302,6 +370,9 @@ type encodedRow struct {
 // projection's ObservedAt is normalized to UTC: it is preserved to the nanosecond
 // (time.Equal) but is read back in UTC without a monotonic clock reading.
 func encode(c admission.Candidate) (encodedRow, error) {
+	if err := checkOwners(c); err != nil {
+		return encodedRow{}, err
+	}
 	blockers, err := json.Marshal(c.Blockers)
 	if err != nil {
 		return encodedRow{}, fmt.Errorf("sqlitestore: encode blockers: %w", err)
@@ -317,6 +388,17 @@ func encode(c admission.Candidate) (encodedRow, error) {
 		row.projection = sql.NullString{String: string(encoded), Valid: true}
 	}
 	return row, nil
+}
+
+// checkOwners refuses a candidate whose blocker owners (map keys or Blocker.Owner)
+// would not survive the JSON encoding byte for byte.
+func checkOwners(c admission.Candidate) error {
+	for owner, b := range c.Blockers {
+		if !utf8.ValidString(string(owner)) || !utf8.ValidString(string(b.Owner)) {
+			return fmt.Errorf("%w: candidate %q owner %q", ErrInvalidOwner, c.CandidateID, owner)
+		}
+	}
+	return nil
 }
 
 func decode(id admission.CandidateID, urgency, priority string, row encodedRow) (admission.Candidate, error) {
