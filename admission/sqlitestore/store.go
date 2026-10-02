@@ -34,7 +34,8 @@ const schemaVersion = 1
 
 // applicationID is stored in PRAGMA application_id (ASCII "PSAD") and marks a file
 // as a PolicyScheduler admission store. Open adopts only a file carrying this marker
-// or a brand-new empty file; any other file is foreign and is refused unwritten.
+// or a brand-new empty file; any other file is foreign and is refused unwritten, also
+// when a crash left it with a non-empty -wal or a hot -journal (see preflight).
 const applicationID = 0x50534144
 
 const schema = `
@@ -116,17 +117,28 @@ func Open(ctx context.Context, path string) (*Store, error) {
 // Close releases the database and its single-writer lock.
 func (s *Store) Close() error { return s.db.Close() }
 
-// preflight protects a file left with a non-empty -wal (a crash, or a live writer).
-// Closing the writable handle after migrate refuses such a file would checkpoint the
-// WAL into it, and SQLite cannot read a WAL database through a read-only handle here
-// without creating a -shm. So ownership is judged, with the WAL applied, on a private
-// copy of the main file and its -wal; the original is opened writable only if the copy
-// is ours or brand-new empty. Ownership refusals are returned; any other probe failure
-// (for example a torn copy of a live writer's WAL) falls through to the writer open,
-// which fences or reports it. A file without a -wal is verified by migrate as before.
+// sidecars are the files next to a database that can hold state not yet in the main
+// file: an uncheckpointed WAL, or a hot rollback journal left by a crash.
+var sidecars = []string{"-wal", "-journal"}
+
+// preflight protects a file left with a non-empty -wal or -journal (a crash, or a live
+// writer). Reading such a file through the writable handle would let SQLite write it
+// before migrate can refuse it: a hot journal is rolled back into the main file on the
+// first read, and closing the handle checkpoints the WAL into it. SQLite cannot read
+// either state through a read-only handle here without that recovery or a new -shm.
+// So ownership is judged, with the sidecars applied, on a private copy of the main file
+// and its sidecars; the original is opened writable only if the copy is ours or
+// brand-new empty. Ownership refusals are returned; any other probe failure (for
+// example a torn copy of a live writer's WAL) falls through to the writer open, which
+// fences or reports it. A file without sidecars is verified by migrate as before.
 func preflight(ctx context.Context, path string) error {
-	info, err := os.Stat(path + "-wal")
-	if err != nil || info.Size() == 0 {
+	present := []string{""}
+	for _, suffix := range sidecars {
+		if info, err := os.Stat(path + suffix); err == nil && info.Size() > 0 {
+			present = append(present, suffix)
+		}
+	}
+	if len(present) == 1 {
 		return nil
 	}
 	dir, err := os.MkdirTemp("", "sqlitestore-preflight-")
@@ -135,7 +147,7 @@ func preflight(ctx context.Context, path string) error {
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 	probe := filepath.Join(dir, "probe.db")
-	for _, suffix := range []string{"", "-wal"} {
+	for _, suffix := range present {
 		if err := copyFile(path+suffix, probe+suffix); err != nil {
 			return fmt.Errorf("sqlitestore: preflight copy: %w", err)
 		}

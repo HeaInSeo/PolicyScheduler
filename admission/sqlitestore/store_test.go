@@ -299,11 +299,70 @@ func TestOpenRefusesForeignCrashStateWAL(t *testing.T) {
 	if err := raw.Close(); err != nil {
 		t.Fatalf("raw close: %v", err)
 	}
+	assertCrashStateRefused(t, path, "-wal")
+}
+
+// A foreign rollback-journal database left after a crash mid-transaction, with pages
+// already spilled into the main file and its -journal still hot, is refused without
+// rolling the journal back: the main file and the -journal stay byte-identical and no
+// -wal or -shm appears.
+func TestOpenRefusesForeignHotJournal(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "crashed.db")
+	raw, err := sql.Open("sqlite", src)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	raw.SetMaxOpenConns(1)
+	for _, stmt := range []string{
+		"PRAGMA journal_mode = DELETE",
+		"PRAGMA cache_size = 1",
+		"CREATE TABLE other (x TEXT)",
+		"INSERT INTO other VALUES ('foreign')",
+		"BEGIN",
+		"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500) " +
+			"INSERT INTO other SELECT hex(randomblob(500)) FROM n",
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	// Copy the files while the transaction is still open: that is the on-disk state a
+	// crash leaves behind (the rollback below would delete the journal).
+	path := filepath.Join(dir, "admission.db")
+	for _, suffix := range []string{"", "-journal"} {
+		b, err := os.ReadFile(src + suffix)
+		if err != nil {
+			t.Fatalf("read %s: %v", src+suffix, err)
+		}
+		if suffix == "-journal" && len(b) == 0 {
+			t.Fatal("precondition: the crash-state journal is empty")
+		}
+		if err := os.WriteFile(path+suffix, b, 0o600); err != nil {
+			t.Fatalf("write %s: %v", path+suffix, err)
+		}
+	}
+	if _, err := raw.Exec("ROLLBACK"); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+	assertCrashStateRefused(t, path, "-journal")
+}
+
+// assertCrashStateRefused requires Open(path) to fail with ErrForeignDatabase while
+// path and path+sidecar stay byte-identical and no other journal/WAL file appears.
+func assertCrashStateRefused(t *testing.T, path, sidecar string) {
+	t.Helper()
+	kept := []string{"", sidecar}
 	before := map[string][]byte{}
-	for _, suffix := range []string{"", "-wal"} {
-		if before[suffix], err = os.ReadFile(path + suffix); err != nil {
+	for _, suffix := range kept {
+		b, err := os.ReadFile(path + suffix)
+		if err != nil {
 			t.Fatalf("read before: %v", err)
 		}
+		before[suffix] = b
 	}
 	if s, err := sqlitestore.Open(context.Background(), path); !errors.Is(err, sqlitestore.ErrForeignDatabase) {
 		if s != nil {
@@ -311,7 +370,7 @@ func TestOpenRefusesForeignCrashStateWAL(t *testing.T) {
 		}
 		t.Fatalf("Open crash-state foreign file: err=%v, want ErrForeignDatabase", err)
 	}
-	for _, suffix := range []string{"", "-wal"} {
+	for _, suffix := range kept {
 		after, err := os.ReadFile(path + suffix)
 		if err != nil {
 			t.Fatalf("refused Open removed %s: %v", path+suffix, err)
@@ -320,7 +379,10 @@ func TestOpenRefusesForeignCrashStateWAL(t *testing.T) {
 			t.Fatalf("refused Open modified %q (%d → %d bytes)", "admission.db"+suffix, len(before[suffix]), len(after))
 		}
 	}
-	for _, suffix := range []string{"-shm", "-journal"} {
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if suffix == sidecar {
+			continue
+		}
 		if _, err := os.Stat(path + suffix); !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("refused Open left %s behind: %v", suffix, err)
 		}
@@ -329,15 +391,21 @@ func TestOpenRefusesForeignCrashStateWAL(t *testing.T) {
 
 // Blocker owners are stored as JSON, which cannot carry invalid UTF-8 byte for byte.
 // Such an owner is refused before anything is written, on create and through an
-// operation; valid owners, including case- and accent-distinct ones, keep their exact
-// bytes across a reopen.
+// operation, whether it is the map key, Blocker.Owner, or both; valid owners,
+// including case- and accent-distinct ones, keep their exact bytes across a reopen.
 func TestBlockerOwnerByteIdentity(t *testing.T) {
 	ctx := context.Background()
 	path := dbPath(t)
 	s := mustOpen(t, path)
-	for name, owner := range map[string]admission.BlockerOwner{"invalid-byte": "\xff", "truncated-rune": "readi\xc3", "invalid-in-valid": "Read\xfeiness"} {
+	for name, owners := range map[string][2]admission.BlockerOwner{
+		"invalid-byte":     {"\xff", "\xff"},
+		"truncated-rune":   {"readi\xc3", "readi\xc3"},
+		"invalid-in-valid": {"Read\xfeiness", "Read\xfeiness"},
+		"invalid-key-only": {"\xff", "Readiness"},
+		"invalid-owner":    {"Readiness", "\xff"},
+	} {
 		cand := admission.Candidate{CandidateID: admission.CandidateID("c-" + name), Blockers: map[admission.BlockerOwner]admission.Blocker{
-			owner: {Owner: owner, State: admission.BlockerActive},
+			owners[0]: {Owner: owners[1], State: admission.BlockerActive},
 		}}
 		if _, err := s.CreateCandidate(ctx, cand); !errors.Is(err, sqlitestore.ErrInvalidOwner) {
 			t.Fatalf("%s: CreateCandidate err=%v, want ErrInvalidOwner", name, err)
