@@ -1,9 +1,12 @@
 package sqlitestore_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sync"
@@ -181,6 +184,78 @@ func TestRejectsNewerSchema(t *testing.T) {
 			_ = s.Close()
 		}
 		t.Fatalf("Open newer schema: err=%v, want ErrUnsupportedSchema", err)
+	}
+}
+
+// A file this package did not create is refused and left byte-identical: it is never
+// stamped, migrated, switched to WAL or adopted.
+func TestOpenRefusesForeignDatabase(t *testing.T) {
+	cases := []struct {
+		name  string
+		stmts []string
+	}{
+		{"unmarked-other-table", []string{"CREATE TABLE other (x TEXT)"}},
+		{"unmarked-lookalike-tables", []string{
+			"CREATE TABLE candidates (candidate_id TEXT PRIMARY KEY, note TEXT)",
+			"INSERT INTO candidates VALUES ('c1', 'foreign')",
+		}},
+		{"unmarked-user-version", []string{"PRAGMA user_version = 1"}},
+		{"other-application-id", []string{"PRAGMA application_id = 1234"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := dbPath(t)
+			raw, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatalf("raw open: %v", err)
+			}
+			for _, stmt := range tc.stmts {
+				if _, err := raw.Exec(stmt); err != nil {
+					t.Fatalf("%s: %v", stmt, err)
+				}
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatalf("raw close: %v", err)
+			}
+			assertOpenLeavesFileUntouched(t, path, sqlitestore.ErrForeignDatabase)
+		})
+	}
+	t.Run("not-sqlite", func(t *testing.T) {
+		path := dbPath(t)
+		if err := os.WriteFile(path, []byte("not a sqlite database, just some bytes\n"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		assertOpenLeavesFileUntouched(t, path, nil)
+	})
+}
+
+// assertOpenLeavesFileUntouched requires Open(path) to fail (with want, if non-nil)
+// and the file to be byte-identical afterwards with no journal/WAL left behind.
+func assertOpenLeavesFileUntouched(t *testing.T, path string, want error) {
+	t.Helper()
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+	s, err := sqlitestore.Open(context.Background(), path)
+	if err == nil {
+		_ = s.Close()
+		t.Fatal("Open adopted a foreign file")
+	}
+	if want != nil && !errors.Is(err, want) {
+		t.Fatalf("Open: err=%v, want %v", err, want)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("refused Open modified the file (%d → %d bytes)", len(before), len(after))
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := os.Stat(path + suffix); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("refused Open left %s behind: %v", suffix, err)
+		}
 	}
 }
 

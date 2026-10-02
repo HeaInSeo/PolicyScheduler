@@ -29,6 +29,11 @@ import (
 // schema is refused rather than reinterpreted.
 const schemaVersion = 1
 
+// applicationID is stored in PRAGMA application_id (ASCII "PSAD") and marks a file
+// as a PolicyScheduler admission store. Open adopts only a file carrying this marker
+// or a brand-new empty file; any other file is foreign and is refused unwritten.
+const applicationID = 0x50534144
+
 const schema = `
 CREATE TABLE IF NOT EXISTS candidates (
 	candidate_id       TEXT NOT NULL PRIMARY KEY,
@@ -52,6 +57,10 @@ var ErrWriterFenced = errors.New("sqlitestore: database is owned by another writ
 // understand.
 var ErrUnsupportedSchema = errors.New("sqlitestore: unsupported schema version")
 
+// ErrForeignDatabase reports an existing database file that was not created by this
+// package. It is never stamped, migrated or adopted.
+var ErrForeignDatabase = errors.New("sqlitestore: database file is not a PolicyScheduler admission store")
+
 // Store is a J1 SQLite admission.Store. It is safe for concurrent use within the
 // owning process: every operation runs in its own transaction on the single
 // connection, so operations are serialized.
@@ -68,9 +77,11 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, fmt.Errorf("sqlitestore: invalid database path %q", path)
 	}
 	// EXCLUSIVE locking must be set before WAL is first used so no shared-memory
-	// index is created; busy_timeout(0) makes a fenced second writer fail fast.
+	// index is created; busy_timeout(0) makes a fenced second writer fail fast. WAL is
+	// not requested here: switching the journal mode writes the file header, so it is
+	// enabled only after migrate has verified the file is ours (see enableWAL).
 	dsn := path + "?_pragma=locking_mode(EXCLUSIVE)&_pragma=busy_timeout(0)" +
-		"&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)&_txlock=immediate"
+		"&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlitestore: open: %w", err)
@@ -81,6 +92,10 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	db.SetConnMaxLifetime(0)
 	db.SetConnMaxIdleTime(0)
 	if err := migrate(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := enableWAL(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -96,21 +111,54 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		return classify("begin migration", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	var version int
+	var appID, version int
+	if err := tx.QueryRowContext(ctx, "PRAGMA application_id").Scan(&appID); err != nil {
+		return classify("read application id", err)
+	}
 	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return classify("read schema version", err)
 	}
-	if version > schemaVersion {
-		return fmt.Errorf("%w: database has %d, this build supports %d", ErrUnsupportedSchema, version, schemaVersion)
+	switch {
+	case appID == applicationID:
+		if version > schemaVersion {
+			return fmt.Errorf("%w: database has %d, this build supports %d", ErrUnsupportedSchema, version, schemaVersion)
+		}
+	case appID == 0 && version == 0:
+		// Unmarked: adopt it only if it is a brand-new empty database.
+		var objects int
+		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master").Scan(&objects); err != nil {
+			return classify("inspect unmarked database", err)
+		}
+		if objects != 0 {
+			return fmt.Errorf("%w: unmarked file already holds %d schema objects", ErrForeignDatabase, objects)
+		}
+	default:
+		return fmt.Errorf("%w: application_id=%#x user_version=%d", ErrForeignDatabase, appID, version)
 	}
 	if _, err := tx.ExecContext(ctx, schema); err != nil {
 		return classify("init schema", err)
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA application_id = %d", applicationID)); err != nil {
+		return classify("write application id", err)
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return classify("write schema version", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return classify("commit migration", err)
+	}
+	return nil
+}
+
+// enableWAL switches the verified database to WAL. The migration commit already holds
+// the EXCLUSIVE lock, so no shared-memory index is created.
+func enableWAL(ctx context.Context, db *sql.DB) error {
+	var mode string
+	if err := db.QueryRowContext(ctx, "PRAGMA journal_mode = WAL").Scan(&mode); err != nil {
+		return classify("enable WAL", err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		return fmt.Errorf("sqlitestore: journal_mode is %q, want wal", mode)
 	}
 	return nil
 }
