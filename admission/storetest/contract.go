@@ -45,7 +45,9 @@ func Run(t *testing.T, h Harness) {
 	t.Run("CreateIgnoresMutableState", func(t *testing.T) { testCreateIgnoresMutableState(t, h) })
 	t.Run("DeepCopy", func(t *testing.T) { testDeepCopy(t, h) })
 	t.Run("ConcurrentCreate", func(t *testing.T) { testConcurrentCreate(t, h) })
+	t.Run("CaseExactIdentity", func(t *testing.T) { testCaseExactIdentity(t, h) })
 	t.Run("OperationLedger", func(t *testing.T) { testOperationLedger(t, h) })
+	t.Run("OperationCrossCandidate", func(t *testing.T) { testOperationCrossCandidate(t, h) })
 	t.Run("ConcurrentOperationReplay", func(t *testing.T) { testConcurrentOperationReplay(t, h) })
 	t.Run("Reopen", func(t *testing.T) { testReopen(t, h) })
 }
@@ -294,6 +296,73 @@ func testOperationLedger(t *testing.T, h Harness) {
 	}
 	if retried.Blockers[ownerAuthorization].State != admission.BlockerCleared {
 		t.Fatalf("retry after failed mutate was not applied: %+v", retried)
+	}
+}
+
+// The operation ledger is keyed by OperationID alone: reusing an id for a different
+// candidate, even with the same fingerprint, conflicts without running mutate and
+// leaves both candidates unchanged. The original operation still replays.
+func testOperationCrossCandidate(t *testing.T, h Harness) {
+	ctx := context.Background()
+	s := h.NewStore(t)
+	mustCreate(t, s, baseCandidate())
+	mustCreate(t, s, candidate("c2", "routine", "normal", ownerAuthorization, ownerReadiness))
+	op := admission.OperationRecord{OperationID: "op-1", CandidateID: "c1", Fingerprint: "clear-readiness"}
+	if _, err := s.ApplyOperation(ctx, op, clearOwner(ownerReadiness)); err != nil {
+		t.Fatalf("ApplyOperation: %v", err)
+	}
+	c1, c2 := mustGet(t, s, "c1"), mustGet(t, s, "c2")
+
+	reused := op
+	reused.CandidateID = "c2"
+	calls := 0
+	_, err := s.ApplyOperation(ctx, reused, func(c *admission.Candidate) error {
+		calls++
+		return clearOwner(ownerReadiness)(c)
+	})
+	if !errors.Is(err, admission.ErrOperationConflict) || calls != 0 {
+		t.Fatalf("same op id, other candidate: err=%v mutateCalls=%d, want ErrOperationConflict/0", err, calls)
+	}
+	if got := mustGet(t, s, "c1"); !reflect.DeepEqual(got, c1) {
+		t.Fatalf("cross-candidate conflict changed the original candidate\nwant=%+v\ngot=%+v", c1, got)
+	}
+	if got := mustGet(t, s, "c2"); !reflect.DeepEqual(got, c2) {
+		t.Fatalf("cross-candidate conflict changed the other candidate\nwant=%+v\ngot=%+v", c2, got)
+	}
+	if replay, err := s.ApplyOperation(ctx, op, clearOwner(ownerReadiness)); err != nil || !reflect.DeepEqual(replay, c1) {
+		t.Fatalf("original op replay after cross-candidate conflict: err=%v got=%+v, want %+v", err, replay, c1)
+	}
+}
+
+// Candidate ids, owner names and operation ids are exact bytes: ids differing only by
+// case are distinct, and an owner set differing only by case is a different
+// registration. A case-folding backend (e.g. COLLATE NOCASE) fails here.
+func testCaseExactIdentity(t *testing.T, h Harness) {
+	ctx := context.Background()
+	s := h.NewStore(t)
+	lower := mustCreate(t, s, candidate("c1", "routine", "normal", ownerReadiness))
+	upper := mustCreate(t, s, candidate("C1", "urgent", "high", ownerReadiness))
+	if got := mustGet(t, s, "c1"); !reflect.DeepEqual(got, lower) {
+		t.Fatalf("candidate c1 changed by C1\nwant=%+v\ngot=%+v", lower, got)
+	}
+	if got := mustGet(t, s, "C1"); !reflect.DeepEqual(got, upper) {
+		t.Fatalf("candidate C1 resolved to another candidate\nwant=%+v\ngot=%+v", upper, got)
+	}
+	if _, err := s.CreateCandidate(ctx, candidate("c1", "routine", "normal", "Readiness")); !errors.Is(err, admission.ErrCandidateConflict) {
+		t.Fatalf("owner differing only by case: err=%v, want ErrCandidateConflict", err)
+	}
+
+	lowerOp := admission.OperationRecord{OperationID: "op-a", CandidateID: "c1", Fingerprint: "clear-readiness"}
+	if _, err := s.ApplyOperation(ctx, lowerOp, clearOwner(ownerReadiness)); err != nil {
+		t.Fatalf("ApplyOperation(op-a): %v", err)
+	}
+	upperOp := admission.OperationRecord{OperationID: "OP-A", CandidateID: "C1", Fingerprint: "clear-readiness-upper"}
+	got, err := s.ApplyOperation(ctx, upperOp, clearOwner(ownerReadiness))
+	if err != nil {
+		t.Fatalf("op id differing only by case is a new operation: err=%v", err)
+	}
+	if got.Blockers[ownerReadiness].State != admission.BlockerCleared {
+		t.Fatalf("OP-A was not applied to C1: %+v", got)
 	}
 }
 
